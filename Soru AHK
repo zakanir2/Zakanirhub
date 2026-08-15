@@ -1,0 +1,1022 @@
+-- ============================================================
+-- NOUVEAU SILENT AIM 360° (UNIQUEMENT JOUEURS)
+-- ============================================================
+_G.SilentAimActive = false          -- Toggle principal (UI)
+_G.SilentAimMaxDist = 2500          -- Portée max (studs)
+_G.SilentAimPart = "Head"           -- Partie visée
+_G.SilentAimTeamCheck = false       -- Éviter les alliés
+_G.SilentAimSelectedPlayer = ""     -- Cible fixe (laisser vide pour "Nearest")
+_G.SilentAimTarget = nil            -- Cible actuelle (mise à jour en temps réel)
+
+local SilentAimServices = {
+    Players = game:GetService("Players"),
+    RunService = game:GetService("RunService"),
+    ReplicatedStorage = game:GetService("ReplicatedStorage")
+}
+local player = SilentAimServices.Players.LocalPlayer
+local camera = workspace.CurrentCamera
+
+-- Fonctions utilitaires (alliance, équipe)
+local function IsAlly(targetPlayer)
+    local main = player:FindFirstChild("PlayerGui") and player.PlayerGui:FindFirstChild("Main")
+    if not main then return false end
+    local alliesFrame = main:FindFirstChild("Allies") and main.Allies:FindFirstChild("Container")
+        and main.Allies.Container:FindFirstChild("Allies") and main.Allies.Container.Allies:FindFirstChild("ScrollingFrame")
+    if not alliesFrame then return false end
+    return alliesFrame:FindFirstChild(targetPlayer.Name) ~= nil
+end
+
+local function IsEnemy(targetPlayer)
+    if not targetPlayer or targetPlayer == player then return false end
+    if IsAlly(targetPlayer) then return false end
+    local myTeam, targetTeam = player.Team, targetPlayer.Team
+    if myTeam and targetTeam then
+        if myTeam.Name == "Marines" and targetTeam.Name == "Marines" then return false end
+        if myTeam.Name == "Pirates" and targetTeam.Name == "Pirates" then return not IsAlly(targetPlayer) end
+        if myTeam.Name == "Marines" and targetTeam.Name == "Pirates" then return true end
+        if myTeam.Name == "Pirates" and targetTeam.Name == "Marines" then return true end
+    end
+    return true
+end
+
+-- Sélection de la cible la plus proche en distance 3D
+local function GetClosestTarget()
+    local myChar = player.Character
+    local myHRP = myChar and myChar:FindFirstChild("HumanoidRootPart")
+    if not myHRP then return nil end
+
+    local maxDist = _G.SilentAimMaxDist or 2500
+    local closest, shortestDist = nil, maxDist
+
+    -- Cible fixe si définie
+    if _G.SilentAimSelectedPlayer and _G.SilentAimSelectedPlayer ~= "" then
+        local targetP = SilentAimServices.Players:FindFirstChild(_G.SilentAimSelectedPlayer)
+        if targetP and targetP ~= player and targetP.Character then
+            if not _G.SilentAimTeamCheck or IsEnemy(targetP) then
+                local hum = targetP.Character:FindFirstChildOfClass("Humanoid")
+                local hrp = targetP.Character:FindFirstChild("HumanoidRootPart")
+                if hum and hum.Health > 0 and hrp then
+                    local worldDist = (hrp.Position - myHRP.Position).Magnitude
+                    if worldDist <= maxDist then
+                        return targetP.Character:FindFirstChild(_G.SilentAimPart) or hrp
+                    end
+                end
+            end
+        end
+        return nil
+    end
+
+    -- Recherche de tous les joueurs
+    for _, p in ipairs(SilentAimServices.Players:GetPlayers()) do
+        if p ~= player then
+            if not _G.SilentAimTeamCheck or IsEnemy(p) then
+                local char = p.Character
+                if char then
+                    local hum = char:FindFirstChildOfClass("Humanoid")
+                    local hrp = char:FindFirstChild("HumanoidRootPart")
+                    if hum and hum.Health > 0 and hrp then
+                        local worldDist = (hrp.Position - myHRP.Position).Magnitude
+                        if worldDist < shortestDist then
+                            shortestDist = worldDist
+                            closest = char:FindFirstChild(_G.SilentAimPart) or hrp
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return closest
+end
+
+-- Hook du module Mouse (redirige Hit et Target UNIQUEMENT pendant le combo)
+local MouseModuleInstance = SilentAimServices.ReplicatedStorage:FindFirstChild("Mouse")
+local MouseModule = nil
+if MouseModuleInstance then
+    pcall(function() MouseModule = require(MouseModuleInstance) end)
+end
+
+if MouseModule and typeof(MouseModule) == "table" then
+    pcall(function()
+        local realStore = { Hit = rawget(MouseModule, "Hit"), Target = rawget(MouseModule, "Target") }
+        local mmt = getrawmetatable(MouseModule)
+        if mmt then setreadonly(mmt, false) else mmt = {}; setmetatable(MouseModule, mmt) end
+        rawset(MouseModule, "Hit", nil); rawset(MouseModule, "Target", nil)
+        mmt.__index = function(self, key)
+            local isRedirectAllowed = _G.SilentAimActive and _G.SilentAimTarget and getgenv().Ahk_isComboActive and not getgenv().Ahk_isVSkillPaused
+            if key == "Hit" then
+                if isRedirectAllowed then return CFrame.new(_G.SilentAimTarget.Position) end
+                return realStore.Hit
+            elseif key == "Target" then
+                if isRedirectAllowed then return _G.SilentAimTarget end
+                return realStore.Target
+            end
+        end
+        mmt.__newindex = function(self, key, value)
+            if key == "Hit" or key == "Target" then realStore[key] = value else rawset(self, key, value) end
+        end
+        setreadonly(mmt, true)
+    end)
+end
+
+-- Mise à jour en continu de la cible
+SilentAimServices.RunService.RenderStepped:Connect(function()
+    if _G.SilentAimActive then
+        _G.SilentAimTarget = GetClosestTarget()
+    else
+        _G.SilentAimTarget = nil
+    end
+end)
+
+-- ============================================================
+-- AHK COMBO SYSTEM (MOBILE)
+-- ============================================================
+local Players = game:GetService("Players")
+local lp = Players.LocalPlayer
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local TweenService = game:GetService("TweenService")
+
+local PlayerGui = lp:WaitForChild("PlayerGui")
+
+-- Nettoyage des anciennes UI
+for _, oldGui in ipairs(PlayerGui:GetChildren()) do
+    if oldGui.Name == "ZakanirHub_AHK_Soru" then
+        oldGui:Destroy()
+    end
+end
+
+-- Couleurs
+local T_BG = Color3.fromRGB(11, 8, 16)         
+local T_CARD = Color3.fromRGB(18, 14, 26)      
+local T_ACCENT = Color3.fromRGB(140, 70, 255)  
+local C = { 
+    text = Color3.fromRGB(245, 240, 255), 
+    muted = Color3.fromRGB(125, 115, 140), 
+    green = Color3.fromRGB(45, 210, 130), 
+    gold = Color3.fromRGB(240, 190, 70), 
+    red = Color3.fromRGB(240, 80, 90), 
+    toggleOff = Color3.fromRGB(35, 30, 45) 
+}
+
+-- Config
+getgenv().Ahk_RemoteSnifferActive = true 
+getgenv().Ahk_SelectedMod = "V2"
+getgenv().Ahk_isComboActive = false 
+getgenv().Ahk_isVSkillPaused = false
+
+-- État interne
+local currentTool, lastTool = nil, nil
+local sharkZActive, vActive, cursedZActive = false, false, false
+local rightTouchActive = false
+local characterConnections = {}
+local lastExecutedSkill = nil
+
+-- Variables ancrage souris
+local isMouseLockedToCorner = false
+local cornerMouseConn = nil
+
+getgenv().Ahk_ActivatedSkills = {
+    Melee = {
+        Z = {active = false, delay = 0, hold = 0},
+        X = {active = false, delay = 0, hold = 0},
+        C = {active = false, delay = 0, hold = 0}
+    },
+    Fruit = {
+        Z = {active = false, delay = 0, hold = 0},
+        X = {active = false, delay = 0, hold = 0},
+        C = {active = false, delay = 0, hold = 0},
+        V = {active = false, delay = 0, hold = 0},
+        F = {active = false, delay = 0, hold = 0},
+        Tap = {active = false, delay = 0, hold = 0}
+    },
+    Sword = {
+        Z = {active = false, delay = 0, hold = 0},
+        X = {active = false, delay = 0, hold = 0}
+    },
+    Gun = {
+        Z = {active = false, delay = 0, hold = 0},
+        X = {active = false, delay = 0, hold = 0}
+    }
+}
+
+-- Fonctions UI
+local function mkFrame(parent, size, pos, color, radius) 
+    local f = Instance.new("Frame", parent)
+    f.Size = size
+    f.Position = pos
+    f.BackgroundColor3 = color
+    f.BorderSizePixel = 0
+    if radius and radius > 0 then 
+        local c = Instance.new("UICorner", f) 
+        c.CornerRadius = UDim.new(0, radius) 
+    end
+    return f 
+end
+
+local function mkLabel(parent, size, pos, text, font, sizeTxt, color, align) 
+    local l = Instance.new("TextLabel", parent)
+    l.Size = size
+    l.Position = pos
+    l.BackgroundTransparency = 1
+    l.Text = text
+    l.Font = font or Enum.Font.Gotham
+    l.TextSize = sizeTxt
+    l.TextColor3 = color
+    l.TextXAlignment = align or Enum.TextXAlignment.Center
+    return l 
+end
+
+local function addStroke(parent, color, thickness, trans) 
+    local s = Instance.new("UIStroke", parent)
+    s.Color = color
+    s.Thickness = thickness or 1
+    s.Transparency = trans or 0
+    return s 
+end
+
+local function clearModuleConnections()
+    for _, conn in ipairs(characterConnections) do pcall(function() conn:Disconnect() end) end
+    characterConnections = {}
+end
+
+local function pauseSA() getgenv().Ahk_isVSkillPaused = true end
+local function restoreSA() getgenv().Ahk_isVSkillPaused = false end
+
+local function isValidStopCondition()
+    return (currentTool and currentTool.Name == "Shark Anchor" and sharkZActive)
+        or (lastTool == "Dough-Dough" and vActive)
+        or (currentTool and currentTool.Name == "Cursed Dual Katana" and cursedZActive)
+end
+
+local function getHRP(m) return m and m:FindFirstChild("HumanoidRootPart") end
+
+local function watchDamageCounter()
+    task.spawn(function()
+        local gui = lp:WaitForChild("PlayerGui"):WaitForChild("Main", 10)
+        if not gui then return end
+        local dmgCounter = gui:WaitForChild("DmgCounter", 10)
+        if not dmgCounter then return end
+        local dmgTextLabel = dmgCounter:WaitForChild("Text", 5)
+        if not dmgTextLabel then return end
+
+        table.insert(characterConnections, dmgTextLabel:GetPropertyChangedSignal("Text"):Connect(function()
+            local dmgText = tonumber(dmgTextLabel.Text) or 0
+            if dmgText > 0 then
+                if isValidStopCondition() and rightTouchActive then pauseSA() end
+            elseif not rightTouchActive then
+                restoreSA()
+            end
+        end))
+    end)
+end
+
+local function hookTool(tool)
+    if not tool then return end
+    currentTool = tool; lastTool = tool.Name
+    table.insert(characterConnections, tool.AncestryChanged:Connect(function(_, parent)
+        if not parent then
+            currentTool, lastTool = nil, nil
+            sharkZActive, vActive, cursedZActive = false, false, false
+            rightTouchActive = false
+            restoreSA()
+        end
+    end))
+end
+
+local isRunReady = true
+
+local function onCharacterAdded(char)
+    clearModuleConnections()
+    sharkZActive, vActive, cursedZActive, rightTouchActive = false, false, false, false
+    restoreSA()
+    isRunReady = true
+
+    for _, child in ipairs(char:GetChildren()) do
+        if child:IsA("Tool") then hookTool(child) end
+    end
+    table.insert(characterConnections, char.ChildAdded:Connect(function(child) if child:IsA("Tool") then hookTool(child) end end))
+    watchDamageCounter()
+end
+
+lp.CharacterAdded:Connect(onCharacterAdded)
+if lp.Character then onCharacterAdded(lp.Character) end
+
+UserInputService.TouchStarted:Connect(function(touch)
+    local cam = workspace.CurrentCamera
+    if not cam then return end
+    if touch.Position.X > cam.ViewportSize.X / 2 then
+        rightTouchActive = true
+        if isValidStopCondition() then pauseSA() end
+    end
+    
+    if isMouseLockedToCorner then
+        isMouseLockedToCorner = false
+        if cornerMouseConn then cornerMouseConn:Disconnect() cornerMouseConn = nil end
+        UserInputService.MouseIconEnabled = true
+    end
+end)
+
+UserInputService.TouchEnded:Connect(function(touch)
+    local cam = workspace.CurrentCamera
+    if not cam then return end
+    if touch.Position.X > cam.ViewportSize.X / 2 then
+        rightTouchActive = false; restoreSA()
+        sharkZActive, vActive, cursedZActive = false, false, false
+    end
+end)
+
+-- ============================================================
+-- INTERFACE GRAPHIQUE
+-- ============================================================
+local ScreenGui = Instance.new("ScreenGui", PlayerGui)
+ScreenGui.Name = "ZakanirHub_AHK_Soru"
+ScreenGui.ResetOnSpawn = false
+
+local MainFrame = mkFrame(ScreenGui, UDim2.new(0, 560, 0, 320), UDim2.new(0.5, -280, 0.5, -160), T_BG, 8)
+addStroke(MainFrame, T_ACCENT, 1.5, 0.1)
+
+local TitleBar = mkFrame(MainFrame, UDim2.new(1, 0, 0, 40), UDim2.new(0, 0, 0, 0), T_BG, 8)
+local Title = mkLabel(TitleBar, UDim2.new(0, 350, 1, 0), UDim2.new(0, 12, 0, 0), "ZakanirHub Ahk soru", Enum.Font.GothamBlack, 12, T_ACCENT, Enum.TextXAlignment.Left)
+
+local MinBtn = Instance.new("TextButton", TitleBar)
+MinBtn.Size = UDim2.new(0, 26, 0, 26)
+MinBtn.Position = UDim2.new(1, -34, 0, 7)
+MinBtn.BackgroundColor3 = T_CARD
+MinBtn.Text = "−"
+MinBtn.TextColor3 = T_ACCENT
+MinBtn.Font = Enum.Font.GothamBold
+MinBtn.TextSize = 14
+Instance.new("UICorner", MinBtn).CornerRadius = UDim.new(0, 4)
+
+local ContentLeft = mkFrame(MainFrame, UDim2.new(0, 260, 1, -52), UDim2.new(0, 12, 0, 44), T_CARD, 6)
+addStroke(ContentLeft, T_ACCENT, 1, 0.8)
+
+local ProfileCard = mkFrame(ContentLeft, UDim2.new(1, -16, 0, 52), UDim2.new(0, 8, 0, 6), T_BG, 6)
+addStroke(ProfileCard, T_ACCENT, 1, 0.85)
+
+local AvatarImg = Instance.new("ImageLabel", ProfileCard)
+AvatarImg.Size = UDim2.new(0, 36, 0, 36)
+AvatarImg.Position = UDim2.new(0, 8, 0.5, -18)
+AvatarImg.BackgroundColor3 = T_CARD
+Instance.new("UICorner", AvatarImg).CornerRadius = UDim.new(1, 0)
+task.spawn(function() 
+    pcall(function() 
+        AvatarImg.Image = Players:GetUserThumbnailAsync(lp.UserId, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size420x420) 
+    end) 
+end)
+
+local UserLbl = mkLabel(ProfileCard, UDim2.new(1, -60, 0, 16), UDim2.new(0, 52, 0, 8), lp.DisplayName, Enum.Font.GothamBold, 11, C.text, Enum.TextXAlignment.Left)
+local StatusLbl = mkLabel(ProfileCard, UDim2.new(1, -60, 0, 14), UDim2.new(0, 52, 0, 22), "Remote Detection: ALWAYS ON", Enum.Font.GothamSemibold, 9, C.green, Enum.TextXAlignment.Left)
+
+local DropdownRow = mkFrame(ContentLeft, UDim2.new(1, -16, 0, 24), UDim2.new(0, 8, 0, 62), T_BG, 6)
+addStroke(DropdownRow, T_ACCENT, 1, 0.85)
+local DropdownLabel = mkLabel(DropdownRow, UDim2.new(0.5, 0, 1, 0), UDim2.new(0, 8, 0, 0), "🤖 SELECTED MOD:", Enum.Font.GothamSemibold, 9, C.text, Enum.TextXAlignment.Left)
+
+local DropdownBtn = Instance.new("TextButton", DropdownRow)
+DropdownBtn.Size = UDim2.new(0, 90, 0, 16)
+DropdownBtn.Position = UDim2.new(1, -98, 0.5, -8)
+DropdownBtn.BackgroundColor3 = T_CARD
+DropdownBtn.Text = "Mod V2 ▼"
+DropdownBtn.TextColor3 = T_ACCENT
+DropdownBtn.Font = Enum.Font.GothamBold
+DropdownBtn.TextSize = 9
+DropdownBtn.ZIndex = 5
+Instance.new("UICorner", DropdownBtn).CornerRadius = UDim.new(0, 4)
+addStroke(DropdownBtn, T_ACCENT, 1, 0.7)
+
+local DropdownContainer = mkFrame(DropdownBtn, UDim2.new(1, 0, 0, 44), UDim2.new(0, 0, 1, 2), T_CARD, 4)
+DropdownContainer.Visible = false
+DropdownContainer.ZIndex = 10
+addStroke(DropdownContainer, T_ACCENT, 1, 0.6)
+
+local OptV1 = Instance.new("TextButton", DropdownContainer)
+OptV1.Size = UDim2.new(1, 0, 0, 22)
+OptV1.Position = UDim2.new(0, 0, 0, 0)
+OptV1.BackgroundTransparency = 1
+OptV1.Text = "Mod V1"
+OptV1.TextColor3 = C.text
+OptV1.Font = Enum.Font.GothamSemibold
+OptV1.TextSize = 9
+OptV1.ZIndex = 11
+
+local OptV2 = Instance.new("TextButton", DropdownContainer)
+OptV2.Size = UDim2.new(1, 0, 0, 22)
+OptV2.Position = UDim2.new(0, 0, 0, 22)
+OptV2.BackgroundTransparency = 1
+OptV2.Text = "Mod V2"
+OptV2.TextColor3 = C.text
+OptV2.Font = Enum.Font.GothamSemibold
+OptV2.TextSize = 9
+OptV2.ZIndex = 11
+
+DropdownBtn.MouseButton1Click:Connect(function() DropdownContainer.Visible = not DropdownContainer.Visible end)
+OptV1.MouseButton1Click:Connect(function() getgenv().Ahk_SelectedMod = "V1" DropdownBtn.Text = "Mod V1 ▼" DropdownContainer.Visible = false end)
+OptV2.MouseButton1Click:Connect(function() getgenv().Ahk_SelectedMod = "V2" DropdownBtn.Text = "Mod V2 ▼" DropdownContainer.Visible = false end)
+
+-- ===== TOGGLE SILENT AIM =====
+local SaRow = mkFrame(ContentLeft, UDim2.new(1, -16, 0, 24), UDim2.new(0, 8, 0, 90), T_BG, 6)
+addStroke(SaRow, T_ACCENT, 1, 0.85)
+local SaLabel = mkLabel(SaRow, UDim2.new(0.5, 0, 1, 0), UDim2.new(0, 8, 0, 0), "🎯 SILENT AIM 360°:", Enum.Font.GothamSemibold, 9, C.text, Enum.TextXAlignment.Left)
+
+local SaBtn = Instance.new("TextButton", SaRow)
+SaBtn.Size = UDim2.new(0, 90, 0, 16)
+SaBtn.Position = UDim2.new(1, -98, 0.5, -8)
+SaBtn.BackgroundColor3 = T_CARD
+SaBtn.Text = "OFF"
+SaBtn.TextColor3 = C.red
+SaBtn.Font = Enum.Font.GothamBold
+SaBtn.TextSize = 9
+Instance.new("UICorner", SaBtn).CornerRadius = UDim.new(0, 4)
+addStroke(SaBtn, T_ACCENT, 1, 0.7)
+
+SaBtn.MouseButton1Click:Connect(function()
+    _G.SilentAimActive = not _G.SilentAimActive
+    if _G.SilentAimActive then
+        SaBtn.Text = "ON"
+        SaBtn.TextColor3 = C.green
+    else
+        SaBtn.Text = "OFF"
+        SaBtn.TextColor3 = C.red
+        _G.SilentAimTarget = nil
+    end
+end)
+
+-- Onglets des compétences
+local TabSelectorFrame = mkFrame(ContentLeft, UDim2.new(1, -16, 0, 22), UDim2.new(0, 8, 0, 118), T_BG, 4)
+addStroke(TabSelectorFrame, T_ACCENT, 1, 0.85)
+
+local TabListLayout = Instance.new("UIGridLayout", TabSelectorFrame)
+TabListLayout.CellSize = UDim2.new(0.25, -2, 1, 0)
+TabListLayout.CellPadding = UDim2.new(0, 2, 0, 0)
+
+local TabContentContainer = mkFrame(ContentLeft, UDim2.new(1, -16, 0, 96), UDim2.new(0, 8, 0, 144), T_BG, 4)
+addStroke(TabContentContainer, T_ACCENT, 1, 0.85)
+
+local allTabsContainers = {}
+local allTabButtons = {}
+
+local function CreateWeaponTab(name)
+    local btn = Instance.new("TextButton", TabSelectorFrame)
+    btn.BackgroundTransparency = 1
+    btn.Text = name
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 8
+    btn.TextColor3 = C.muted
+    allTabButtons[name] = btn
+
+    local container = Instance.new("ScrollingFrame", TabContentContainer)
+    container.Size = UDim2.new(1, -8, 1, -8)
+    container.Position = UDim2.new(0, 4, 0, 4)
+    container.BackgroundTransparency = 1
+    container.Visible = false
+    container.CanvasSize = UDim2.new(0, 0, 0, 0)
+    container.ScrollBarThickness = 2
+    container.ScrollBarImageColor3 = T_ACCENT
+    allTabsContainers[name] = container
+
+    local list = Instance.new("UIListLayout", container)
+    list.SortOrder = Enum.SortOrder.LayoutOrder
+    list.Padding = UDim.new(0, 4)
+
+    list:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+        container.CanvasSize = UDim2.new(0, 0, 0, list.AbsoluteContentSize.Y)
+    end)
+
+    btn.MouseButton1Click:Connect(function()
+        for tName, tContainer in pairs(allTabsContainers) do
+            tContainer.Visible = (tName == name)
+            allTabButtons[tName].TextColor3 = (tName == name) and T_ACCENT or C.muted
+        end
+    end)
+    return container
+end
+
+local meleeTab = CreateWeaponTab("Melee")
+local fruitTab = CreateWeaponTab("Fruit")
+local swordTab = CreateWeaponTab("Sword")
+local gunTab = CreateWeaponTab("Gun")
+
+allTabsContainers["Melee"].Visible = true
+allTabButtons["Melee"].TextColor3 = T_ACCENT
+
+local ContentRight = mkFrame(MainFrame, UDim2.new(1, -296, 1, -52), UDim2.new(0, 284, 0, 44), T_CARD, 6)
+addStroke(ContentRight, T_ACCENT, 1, 0.8)
+
+local ListTitle = mkLabel(ContentRight, UDim2.new(1, -16, 0, 20), UDim2.new(0, 8, 0, 8), "⚔️ ACTIVE COMBO ATTACK QUEUE LIST", Enum.Font.GothamBold, 10, T_ACCENT, Enum.TextXAlignment.Left)
+
+local QueueScroll = Instance.new("ScrollingFrame", ContentRight)
+QueueScroll.Size = UDim2.new(1, -16, 1, -74)
+QueueScroll.Position = UDim2.new(0, 8, 0, 32)
+QueueScroll.BackgroundTransparency = 1
+QueueScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+QueueScroll.ScrollBarThickness = 2
+QueueScroll.ScrollBarImageColor3 = T_ACCENT
+
+local uiList = Instance.new("UIListLayout", QueueScroll)
+uiList.SortOrder = Enum.SortOrder.LayoutOrder
+uiList.Padding = UDim.new(0, 4)
+
+local CalcBtn = Instance.new("TextButton", ContentRight)
+CalcBtn.Size = UDim2.new(1, -16, 0, 26)
+CalcBtn.Position = UDim2.new(0, 8, 1, -34)
+CalcBtn.BackgroundColor3 = T_BG
+CalcBtn.Text = "⚡ delay calculator (ANTI-BUG)"
+CalcBtn.TextColor3 = Color3.fromRGB(240, 190, 70) 
+CalcBtn.Font = Enum.Font.GothamBlack
+CalcBtn.TextSize = 9
+Instance.new("UICorner", CalcBtn).CornerRadius = UDim.new(0, 6)
+addStroke(CalcBtn, Color3.fromRGB(240, 190, 70), 1, 0.3)
+
+local comboQueue = {}
+local checkboxRegistry = {}
+local delayBoxesRegistry = {} 
+
+local function RedrawQueueOrder()
+    for index, item in ipairs(comboQueue) do
+        item.row.LayoutOrder = index
+        local orderLabel = item.row:FindFirstChild("OrderLabel")
+        if orderLabel then
+            local data = getgenv().Ahk_ActivatedSkills[item.cat][item.skill]
+            orderLabel.Text = string.format("[%d] %s (%s) — D: %ss | H: %ss", index, item.cat, item.skill, tostring(data.delay), tostring(data.hold))
+        end
+    end
+    QueueScroll.CanvasSize = UDim2.new(0, 0, 0, uiList.AbsoluteContentSize.Y)
+end
+
+local function syncCheckboxUI(catName, keyName, state)
+    local cb = checkboxRegistry[catName .. "_" .. keyName]
+    if cb then
+        local targetColor = state and T_ACCENT or C.toggleOff
+        local targetPos = state and UDim2.new(1, -10, 0.5, -4) or UDim2.new(0, 2, 0.5, -4)
+        TweenService:Create(cb.box, TweenInfo.new(0.1, Enum.EasingStyle.Quad), {BackgroundColor3 = targetColor}):Play()
+        TweenService:Create(cb.dot, TweenInfo.new(0.1, Enum.EasingStyle.Quad), {Position = targetPos}):Play()
+    end
+end
+
+local function removeFromQueue(catName, keyName)
+    for i, item in ipairs(comboQueue) do
+        if item.cat == catName and item.skill == keyName then
+            if item.row then item.row:Destroy() end
+            table.remove(comboQueue, i)
+            break
+        end
+    end
+    RedrawQueueOrder()
+end
+
+local function addToQueue(catName, keyName)
+    for _, item in ipairs(comboQueue) do
+        if item.cat == catName and item.skill == keyName then return end
+    end
+
+    local qRow = mkFrame(QueueScroll, UDim2.new(1, -4, 0, 26), UDim2.new(0, 0, 0, 0), T_BG, 4)
+    addStroke(qRow, T_ACCENT, 1, 0.9)
+
+    local lbl = mkLabel(qRow, UDim2.new(1, -30, 1, 0), UDim2.new(0, 8, 0, 0), "", Enum.Font.GothamBold, 9, C.text, Enum.TextXAlignment.Left)
+    lbl.Name = "OrderLabel"
+
+    local delBtn = Instance.new("TextButton", qRow)
+    delBtn.Size = UDim2.new(0, 16, 0, 16)
+    delBtn.Position = UDim2.new(1, -20, 0.5, -8)
+    delBtn.BackgroundColor3 = T_CARD
+    delBtn.Text = "×"
+    delBtn.TextColor3 = C.red
+    delBtn.Font = Enum.Font.GothamBold
+    delBtn.TextSize = 12
+    Instance.new("UICorner", delBtn).CornerRadius = UDim.new(0, 4)
+
+    local item = { cat = catName, skill = keyName, row = qRow }
+    table.insert(comboQueue, item)
+
+    delBtn.MouseButton1Click:Connect(function()
+        getgenv().Ahk_ActivatedSkills[catName][keyName].active = false
+        syncCheckboxUI(catName, keyName, false)
+        removeFromQueue(catName, keyName)
+    end)
+
+    RedrawQueueOrder()
+end
+
+local function AddSkillConfigRow(parent, catName, keyName)
+    local row = mkFrame(parent, UDim2.new(1, -4, 0, 26), UDim2.new(0, 0, 0, 0), T_CARD, 4)
+    addStroke(row, T_ACCENT, 1, 0.9)
+    
+    mkLabel(row, UDim2.new(0, 42, 1, 0), UDim2.new(0, 6, 0, 0), "Skill " .. keyName, Enum.Font.GothamSemibold, 9, C.text, Enum.TextXAlignment.Left)
+
+    local delayBox = Instance.new("TextBox", row)
+    delayBox.Size = UDim2.new(0, 52, 1, -8)
+    delayBox.Position = UDim2.new(0, 52, 0, 4)
+    delayBox.BackgroundColor3 = T_BG
+    delayBox.Text = "0s"
+    delayBox.PlaceholderText = "Delay"
+    delayBox.TextColor3 = T_ACCENT
+    delayBox.Font = Enum.Font.GothamBold
+    delayBox.TextSize = 8
+    Instance.new("UICorner", delayBox).CornerRadius = UDim.new(0, 4)
+    addStroke(delayBox, T_ACCENT, 1, 0.8)
+
+    delayBoxesRegistry[catName .. "_" .. keyName] = delayBox
+
+    local holdBox = Instance.new("TextBox", row)
+    holdBox.Size = UDim2.new(0, 52, 1, -8)
+    holdBox.Position = UDim2.new(0, 110, 0, 4)
+    holdBox.BackgroundColor3 = T_BG
+    holdBox.Text = "0s"
+    holdBox.PlaceholderText = "Hold"
+    holdBox.TextColor3 = T_ACCENT
+    holdBox.Font = Enum.Font.GothamBold
+    holdBox.TextSize = 8
+    Instance.new("UICorner", holdBox).CornerRadius = UDim.new(0, 4)
+    addStroke(holdBox, T_ACCENT, 1, 0.8)
+
+    local checkbox = Instance.new("TextButton", row)
+    checkbox.Size = UDim2.new(0, 24, 0, 12)
+    checkbox.Position = UDim2.new(1, -30, 0.5, -6)
+    checkbox.BackgroundColor3 = C.toggleOff 
+    checkbox.Text = ""
+    Instance.new("UICorner", checkbox).CornerRadius = UDim.new(1, 0)
+
+    local dot = Instance.new("Frame", checkbox)
+    dot.Size = UDim2.new(0, 8, 0, 8)
+    dot.Position = UDim2.new(0, 2, 0.5, -4) 
+    dot.BackgroundColor3 = Color3.new(1, 1, 1)
+    Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
+
+    checkboxRegistry[catName .. "_" .. keyName] = { box = checkbox, dot = dot }
+
+    delayBox.FocusLost:Connect(function()
+        local val = tonumber(delayBox.Text:match("[%d%.]+")) or 0
+        getgenv().Ahk_ActivatedSkills[catName][keyName].delay = val
+        delayBox.Text = val .. "s"
+        RedrawQueueOrder()
+    end)
+
+    holdBox.FocusLost:Connect(function()
+        local val = tonumber(holdBox.Text:match("[%d%.]+")) or 0
+        getgenv().Ahk_ActivatedSkills[catName][keyName].hold = val
+        holdBox.Text = val .. "s"
+        RedrawQueueOrder()
+    end)
+
+    checkbox.MouseButton1Click:Connect(function()
+        local newState = not getgenv().Ahk_ActivatedSkills[catName][keyName].active
+        getgenv().Ahk_ActivatedSkills[catName][keyName].active = newState
+        syncCheckboxUI(catName, keyName, newState)
+        if newState then
+            addToQueue(catName, keyName)
+        else
+            removeFromQueue(catName, keyName)
+        end
+    end)
+end
+
+-- Création des lignes de compétences
+AddSkillConfigRow(meleeTab, "Melee", "Z")
+AddSkillConfigRow(meleeTab, "Melee", "X")
+AddSkillConfigRow(meleeTab, "Melee", "C")
+AddSkillConfigRow(fruitTab, "Fruit", "Z")
+AddSkillConfigRow(fruitTab, "Fruit", "X")
+AddSkillConfigRow(fruitTab, "Fruit", "C")
+AddSkillConfigRow(fruitTab, "Fruit", "V")
+AddSkillConfigRow(fruitTab, "Fruit", "F")
+AddSkillConfigRow(fruitTab, "Fruit", "Tap")
+AddSkillConfigRow(swordTab, "Sword", "Z")
+AddSkillConfigRow(swordTab, "Sword", "X")
+AddSkillConfigRow(gunTab, "Gun", "Z")
+AddSkillConfigRow(gunTab, "Gun", "X")
+
+uiList:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+    QueueScroll.CanvasSize = UDim2.new(0, 0, 0, uiList.AbsoluteContentSize.Y)
+end)
+
+CalcBtn.MouseButton1Click:Connect(function()
+    local ping = lp:GetNetworkPing()
+    local prevCat = nil
+    
+    for index, item in ipairs(comboQueue) do
+        local cat = item.cat
+        local skill = item.skill
+        local data = getgenv().Ahk_ActivatedSkills[cat][skill]
+        
+        local optimalDelay = 0
+        if index == 1 then
+            optimalDelay = math.max(0.05, tonumber(string.format("%.2f", ping * 1.2)))
+        else
+            if prevCat ~= cat then
+                optimalDelay = math.max(0.18, tonumber(string.format("%.2f", ping * 1.7)))
+            else
+                optimalDelay = math.max(0.04, tonumber(string.format("%.2f", ping * 0.9)))
+            end
+        end
+        
+        data.delay = optimalDelay
+        
+        local box = delayBoxesRegistry[cat .. "_" .. skill]
+        if box then
+            box.Text = optimalDelay .. "s"
+        end
+        
+        prevCat = cat
+    end
+    
+    RedrawQueueOrder()
+    
+    CalcBtn.Text = "✔️ DÉLAIS LOGIQUES APPLIQUÉS !"
+    task.wait(1)
+    CalcBtn.Text = "⚡ CALCULER PING DELAY (ANTI-BUG)"
+end)
+
+-- Mini bar & logo
+local miniBar = Instance.new("Frame", ScreenGui)
+miniBar.Size = UDim2.new(0, 40, 0, 40)
+miniBar.Position = UDim2.new(0.02, 0, 0.05, 0)
+miniBar.BackgroundColor3 = T_BG
+miniBar.BackgroundTransparency = 1 
+miniBar.Visible = false
+Instance.new("UICorner", miniBar).CornerRadius = UDim.new(1, 0)
+addStroke(miniBar, T_ACCENT, 1.5, 0.3)
+
+local miniLogo = Instance.new("ImageLabel", miniBar)
+miniLogo.Size = UDim2.new(1, 0, 1, 0)
+miniLogo.BackgroundTransparency = 1
+miniLogo.ZIndex = 10 
+Instance.new("UICorner", miniLogo).CornerRadius = UDim.new(1, 0)
+
+local logoUrl = "https://github.com/ApparentlyZen/image-namelessWare/blob/main/165abdd521328d77324b02ce8a77e090_1780162334922.webp?raw=true"
+task.spawn(function()
+    pcall(function()
+        if writefile and getcustomasset and game.HttpGet then
+            if not isfile("zakanirhub_logo.webp") then writefile("zakanirhub_logo.webp", game:HttpGet(logoUrl)) end
+            miniLogo.Image = getcustomasset("zakanirhub_logo.webp")
+        else
+            miniLogo.Image = logoUrl
+        end
+    end)
+end)
+
+local minimized = false
+local function toggleUI() 
+    minimized = not minimized 
+    MainFrame.Visible = not minimized 
+    miniBar.Visible = minimized 
+end
+
+MinBtn.MouseButton1Click:Connect(toggleUI)
+
+local miniDragging = false
+local miniDragInput, miniDragStart, miniStartPos, miniMoved = nil, nil, nil, false
+
+miniBar.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        miniDragging = true
+        miniMoved = false
+        miniDragStart = input.Position
+        miniStartPos = miniBar.Position
+    end
+end)
+
+miniBar.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+        miniDragInput = input
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if input == miniDragInput and miniDragging then
+        local delta = input.Position - miniDragStart
+        if delta.Magnitude > 8 then miniMoved = true end
+        miniBar.Position = UDim2.new(miniStartPos.X.Scale, miniStartPos.X.Offset + delta.X, miniStartPos.Y.Scale, miniStartPos.Y.Offset + delta.Y)
+    end
+end)
+
+miniBar.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        if miniDragging then
+            miniDragging = false
+            if not miniMoved then toggleUI() end
+        end
+    end
+end)
+
+local dragging, dragInput, dragStart, startPos
+TitleBar.InputBegan:Connect(function(input) 
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then 
+        dragging = true 
+        dragStart = input.Position 
+        startPos = MainFrame.Position 
+        input.Changed:Connect(function() 
+            if input.UserInputState == Enum.UserInputState.End then dragging = false end 
+        end) 
+    end 
+end)
+
+TitleBar.InputChanged:Connect(function(input) 
+    if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then dragInput = input end 
+end)
+
+UserInputService.InputChanged:Connect(function(input) 
+    if input == dragInput and dragging then 
+        local delta = input.Position - dragStart 
+        MainFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y) 
+    end 
+end)
+
+-- ============================================================
+-- EXÉCUTION DU COMBO
+-- ============================================================
+local soruSignal = false
+local canTrigger = true
+local COMBOMAX_COOLDOWN = 0.3
+
+local function GetKeyCode(str)
+    str = string.upper(str)
+    if str == "1" then return Enum.KeyCode.One
+    elseif str == "2" then return Enum.KeyCode.Two
+    elseif str == "3" then return Enum.KeyCode.Three
+    elseif str == "4" then return Enum.KeyCode.Four
+    end
+    local success, keyCode = pcall(function() return Enum.KeyCode[str] end)
+    if success then return keyCode end
+    return nil
+end
+
+local function GetSlotFromCategory(cat)
+    if cat == "Melee" then return "1"
+    elseif cat == "Fruit" then return "2"
+    elseif cat == "Sword" then return "3"
+    elseif cat == "Gun" then return "4"
+    end
+    return "1"
+end
+
+local function ForceEquipToolByTip(category)
+    local char = lp.Character
+    if not char then return nil end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hum then return nil end
+
+    local targetTip = category
+    if category == "Fruit" then targetTip = "Blox Fruit" end
+
+    for _, tool in ipairs(char:GetChildren()) do
+        if tool:IsA("Tool") then
+            if tool.ToolTip == targetTip or tool.Name:lower():find(category:lower()) then
+                return tool
+            end
+        end
+    end
+
+    for _, tool in ipairs(lp.Backpack:GetChildren()) do
+        if tool:IsA("Tool") and (tool.ToolTip == targetTip or tool.Name:lower():find(category:lower())) then
+            hum:EquipTool(tool)
+            return tool
+        end
+    end
+    return nil
+end
+
+local function pressKey(keyCode)
+    VirtualInputManager:SendKeyEvent(true, keyCode, false, game)
+    VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
+    VirtualInputManager:SendKeyEvent(true, keyCode, false, game)
+    VirtualInputManager:SendKeyEvent(false, keyCode, false, game)
+end
+
+task.spawn(function()
+    while true do
+        if soruSignal then
+            soruSignal = false
+            
+            if canTrigger and #comboQueue > 0 then
+                canTrigger = false
+                getgenv().Ahk_isComboActive = true 
+
+                for index, item in ipairs(comboQueue) do
+                    local cat = item.cat
+                    local data = getgenv().Ahk_ActivatedSkills[cat][item.skill]
+                    
+                    if data and data.active == true and getgenv().Ahk_isComboActive then
+                        
+                        if getgenv().Ahk_SelectedMod == "V2" then
+                            ForceEquipToolByTip(cat)
+                        else
+                            local slotStr = GetSlotFromCategory(cat)
+                            local toolKey = GetKeyCode(slotStr)
+                            if toolKey then
+                                pressKey(toolKey)
+                            end
+                        end
+                        
+                        if data.delay and data.delay > 0 then
+                            task.wait(data.delay)
+                        end
+                        
+                        local skill = item.skill
+                        
+                        if skill == "Tap" then
+                            if mousemoveabs then
+                                mousemoveabs(0, 0)
+                            else
+                                VirtualInputManager:SendMouseMoveEvent(0, 0, game)
+                            end
+                            
+                            if data.hold and data.hold > 0 then
+                                VirtualInputManager:SendMouseButtonEvent(0, 0, 0, true, game, 0)
+                                task.wait(data.hold)
+                                VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 0)
+                            else
+                                VirtualInputManager:SendMouseButtonEvent(0, 0, 0, true, game, 0)
+                                VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 0)
+                                VirtualInputManager:SendMouseButtonEvent(0, 0, 0, true, game, 0)
+                                VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 0)
+                            end
+                            StatusLbl.Text = "👆 [" .. index .. "] Tap exécuté"
+                            StatusLbl.TextColor3 = C.green
+                        else
+                            local skillKey = GetKeyCode(skill)
+                            if skillKey then
+                                if data.hold and data.hold > 0 then
+                                    VirtualInputManager:SendKeyEvent(true, skillKey, false, game)
+                                    task.wait(data.hold)
+                                    VirtualInputManager:SendKeyEvent(false, skillKey, false, game)
+                                else
+                                    VirtualInputManager:SendKeyEvent(true, skillKey, false, game)
+                                    VirtualInputManager:SendKeyEvent(false, skillKey, false, game)
+                                    VirtualInputManager:SendKeyEvent(true, skillKey, false, game)
+                                    VirtualInputManager:SendKeyEvent(false, skillKey, false, game)
+                                end
+                                StatusLbl.Text = "🎯 [" .. index .. "] Skill envoyé : " .. skill
+                                StatusLbl.TextColor3 = C.green
+                            end
+                        end
+                        
+                        RunService.Heartbeat:Wait()
+                    end
+                end
+                
+                task.wait(0.2) 
+                getgenv().Ahk_isComboActive = false 
+                StatusLbl.Text = "Remote Detection: ALWAYS ON"
+                StatusLbl.TextColor3 = C.green
+
+                isRunReady = true
+
+                -- RELEASE MOUSE LOCK & ICON
+                isMouseLockedToCorner = false
+                if cornerMouseConn then cornerMouseConn:Disconnect(); cornerMouseConn = nil end
+                UserInputService.MouseIconEnabled = true
+
+                task.wait(COMBOMAX_COOLDOWN)
+                canTrigger = true
+            end
+        end
+        RunService.Heartbeat:Wait()
+    end
+end)
+
+-- ============================================================
+-- HOOK __NAMECALL AVEC SILENT AIM UNIQUEMENT PENDANT LE COMBO
+-- ============================================================
+local commERemote = ReplicatedStorage:WaitForChild("Remotes", 10) and ReplicatedStorage.Remotes:WaitForChild("CommE", 10)
+local oldNamecall
+oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+    local method = getnamecallmethod()
+    local args = {...}
+
+    -- Détection du Soru (déclenche le combo)
+    if self == commERemote and (string.lower(method) == "fireserver") and args[1] == "Soru" then
+        local gameProcessed = false
+        if isRunReady and not gameProcessed then
+            isRunReady = false
+            soruSignal = true
+        end
+    end
+
+    -- Détection des skills Z et V pour les conditions de pause
+    if typeof(args[1]) == "string" then
+        local skill = args[1]:upper()
+        if skill == "Z" and currentTool then
+            if currentTool.Name == "Shark Anchor" then sharkZActive = true end
+            if currentTool.Name == "Cursed Dual Katana" then cursedZActive = true end
+        elseif skill == "V" and lastTool == "Dough-Dough" then
+            vActive = true
+        end
+    end
+
+    -- REDIRECTION SILENT AIM UNIQUEMENT PENDANT LE COMBO
+    if _G.SilentAimActive and _G.SilentAimTarget and getgenv().Ahk_isComboActive and not getgenv().Ahk_isVSkillPaused then
+        local HookPosition = _G.SilentAimTarget.Position
+        if HookPosition then
+            -- Pour FireServer / InvokeServer avec des positions
+            if method == "FireServer" and tostring(self) == "RemoteEvent" and tostring(args[1]) ~= "true" and tostring(args[1]) ~= "false" then
+                args[1] = HookPosition
+            elseif method == "InvokeServer" and self.Parent and tostring(self.Parent) == "Humanoid" and tostring(args[2]) ~= "true" and tostring(args[2]) ~= "false" and type(args[2]) == "vector" then
+                args[2] = HookPosition
+            end
+        end
+    end
+
+    return oldNamecall(self, unpack(args))
+end)
